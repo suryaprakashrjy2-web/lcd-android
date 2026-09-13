@@ -34,6 +34,7 @@ class MainActivity : AppCompatActivity() {
     private val BACKEND_URL = "https://lcd-backend.onrender.com/chat"
     private val TELUGU_LOCALE = Locale("te", "IN")
     private val WAKE_WORD = "hey lcd"
+    private val WATCHDOG_TIMEOUT_MS = 12000L
 
     private lateinit var statusText: TextView
     private lateinit var heardText: TextView
@@ -41,9 +42,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var talkButton: Button
 
     private lateinit var tts: TextToSpeech
-    private lateinit var speechRecognizer: SpeechRecognizer
+    private var speechRecognizer: SpeechRecognizer? = null
     private val httpClient = OkHttpClient()
     private val mainHandler = Handler(Looper.getMainLooper())
+    private var watchdog: Runnable? = null
 
     private var isListeningModeOn = false
     private var isAwaitingCommand = false
@@ -88,9 +90,6 @@ class MainActivity : AppCompatActivity() {
             }
         })
 
-        speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
-        speechRecognizer.setRecognitionListener(recognitionListener)
-
         permissionLauncher.launch(
             arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.CALL_PHONE)
         )
@@ -120,16 +119,33 @@ class MainActivity : AppCompatActivity() {
         isAwaitingCommand = false
         talkButton.text = "▶ Start listening for \"Hey LCD\""
         statusText.text = "Stopped"
+        cancelWatchdog()
+        destroyRecognizer()
+    }
+
+    private fun cancelWatchdog() {
+        watchdog?.let { mainHandler.removeCallbacks(it) }
+        watchdog = null
+    }
+
+    private fun destroyRecognizer() {
         try {
-            speechRecognizer.stopListening()
-            speechRecognizer.cancel()
+            speechRecognizer?.stopListening()
+            speechRecognizer?.cancel()
+            speechRecognizer?.destroy()
         } catch (e: Exception) {
         }
+        speechRecognizer = null
     }
 
     private fun startWakeWordListening() {
         if (!isListeningModeOn) return
         statusText.text = if (isAwaitingCommand) "Yes? Listening for your command..." else "Listening for \"Hey LCD\"..."
+
+        destroyRecognizer()
+        val recognizer = SpeechRecognizer.createSpeechRecognizer(this)
+        recognizer.setRecognitionListener(recognitionListener)
+        speechRecognizer = recognizer
 
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
@@ -138,16 +154,29 @@ class MainActivity : AppCompatActivity() {
             putExtra("android.speech.extra.SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS", 2000)
             putExtra("android.speech.extra.SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS", 2000)
         }
+
         try {
-            speechRecognizer.startListening(intent)
+            recognizer.startListening(intent)
         } catch (e: Exception) {
             mainHandler.postDelayed({ if (isListeningModeOn) startWakeWordListening() }, 500)
+            return
         }
+
+        cancelWatchdog()
+        val newWatchdog = Runnable {
+            if (isListeningModeOn) {
+                startWakeWordListening()
+            }
+        }
+        watchdog = newWatchdog
+        mainHandler.postDelayed(newWatchdog, WATCHDOG_TIMEOUT_MS)
     }
 
     private val recognitionListener = object : RecognitionListener {
         override fun onReadyForSpeech(params: Bundle?) {}
-        override fun onBeginningOfSpeech() {}
+        override fun onBeginningOfSpeech() {
+            cancelWatchdog()
+        }
         override fun onRmsChanged(rmsdB: Float) {}
         override fun onBufferReceived(buffer: ByteArray?) {}
         override fun onEndOfSpeech() {}
@@ -155,12 +184,14 @@ class MainActivity : AppCompatActivity() {
         override fun onPartialResults(partialResults: Bundle?) {}
 
         override fun onError(error: Int) {
+            cancelWatchdog()
             if (isListeningModeOn) {
                 mainHandler.postDelayed({ startWakeWordListening() }, 400)
             }
         }
 
         override fun onResults(results: Bundle?) {
+            cancelWatchdog()
             val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 ?.firstOrNull()
                 ?.trim()
@@ -328,12 +359,8 @@ class MainActivity : AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
-        if (isListeningModeOn) {
-            try {
-                speechRecognizer.stopListening()
-                speechRecognizer.cancel()
-            } catch (e: Exception) { }
-        }
+        cancelWatchdog()
+        destroyRecognizer()
     }
 
     override fun onResume() {
@@ -344,9 +371,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        cancelWatchdog()
         tts.stop()
         tts.shutdown()
-        speechRecognizer.destroy()
+        destroyRecognizer()
         super.onDestroy()
     }
 }
