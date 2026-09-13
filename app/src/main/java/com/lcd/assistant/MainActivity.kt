@@ -5,14 +5,9 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.provider.MediaStore
-import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
@@ -33,8 +28,6 @@ class MainActivity : AppCompatActivity() {
 
     private val BACKEND_URL = "https://lcd-backend.onrender.com/chat"
     private val TELUGU_LOCALE = Locale("te", "IN")
-    private val WAKE_WORD = "hey lcd"
-    private val WATCHDOG_TIMEOUT_MS = 12000L
 
     private lateinit var statusText: TextView
     private lateinit var heardText: TextView
@@ -42,21 +35,26 @@ class MainActivity : AppCompatActivity() {
     private lateinit var talkButton: Button
 
     private lateinit var tts: TextToSpeech
-    private var speechRecognizer: SpeechRecognizer? = null
     private val httpClient = OkHttpClient()
-    private val mainHandler = Handler(Looper.getMainLooper())
-    private var watchdog: Runnable? = null
 
-    private var isListeningModeOn = false
-    private var isAwaitingCommand = false
-
-    private val permissionLauncher =
-        registerForActivityResult(androidx.activity.result.contract.ActivityResultContracts.RequestMultiplePermissions()) { grants ->
-            val micGranted = grants[Manifest.permission.RECORD_AUDIO] == true
-            if (!micGranted) {
-                Toast.makeText(this, "Microphone permission is needed for 'Hey LCD'", Toast.LENGTH_LONG).show()
+    private val speechLauncher =
+        registerForActivityResult(androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult()) { result ->
+            if (result.resultCode == RESULT_OK) {
+                val results = result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
+                val spokenText = results?.firstOrNull()
+                if (!spokenText.isNullOrBlank()) {
+                    heardText.text = "You said: $spokenText"
+                    sendToBackend(spokenText)
+                } else {
+                    statusText.text = "Didn't catch that — tap and try again"
+                }
+            } else {
+                statusText.text = "Tap the button and speak"
             }
         }
+
+    private val permissionLauncher =
+        registerForActivityResult(androidx.activity.result.contract.ActivityResultContracts.RequestMultiplePermissions()) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -75,163 +73,36 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
-        tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-            override fun onStart(utteranceId: String?) {}
-            override fun onDone(utteranceId: String?) {
-                if (isListeningModeOn) {
-                    mainHandler.post { startWakeWordListening() }
-                }
-            }
-            @Deprecated("Deprecated in Java")
-            override fun onError(utteranceId: String?) {
-                if (isListeningModeOn) {
-                    mainHandler.post { startWakeWordListening() }
-                }
-            }
-        })
 
         permissionLauncher.launch(
             arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.CALL_PHONE)
         )
 
-        talkButton.text = "▶ Start listening for \"Hey LCD\""
-        talkButton.setOnClickListener { toggleListeningMode() }
+        talkButton.text = "🎤 Tap to talk"
+        talkButton.setOnClickListener { startListening() }
     }
 
-    private fun toggleListeningMode() {
-        if (isListeningModeOn) {
-            stopListeningMode()
-        } else {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-                != PackageManager.PERMISSION_GRANTED
-            ) {
-                ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), 100)
-                return
-            }
-            isListeningModeOn = true
-            talkButton.text = "⏹ Stop listening"
-            startWakeWordListening()
-        }
-    }
-
-    private fun stopListeningMode() {
-        isListeningModeOn = false
-        isAwaitingCommand = false
-        talkButton.text = "▶ Start listening for \"Hey LCD\""
-        statusText.text = "Stopped"
-        cancelWatchdog()
-        destroyRecognizer()
-    }
-
-    private fun cancelWatchdog() {
-        watchdog?.let { mainHandler.removeCallbacks(it) }
-        watchdog = null
-    }
-
-    private fun destroyRecognizer() {
-        try {
-            speechRecognizer?.stopListening()
-            speechRecognizer?.cancel()
-            speechRecognizer?.destroy()
-        } catch (e: Exception) {
-        }
-        speechRecognizer = null
-    }
-
-    private fun startWakeWordListening() {
-        if (!isListeningModeOn) return
-        statusText.text = if (isAwaitingCommand) "Yes? Listening for your command..." else "Listening for \"Hey LCD\"..."
-
-        destroyRecognizer()
-        val recognizer = SpeechRecognizer.createSpeechRecognizer(this)
-        recognizer.setRecognitionListener(recognitionListener)
-        speechRecognizer = recognizer
-
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "te-IN")
-            putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
-            putExtra("android.speech.extra.SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS", 2000)
-            putExtra("android.speech.extra.SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS", 2000)
-        }
-
-        try {
-            recognizer.startListening(intent)
-        } catch (e: Exception) {
-            mainHandler.postDelayed({ if (isListeningModeOn) startWakeWordListening() }, 500)
+    private fun startListening() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), 100)
             return
         }
 
-        cancelWatchdog()
-        val newWatchdog = Runnable {
-            if (isListeningModeOn) {
-                startWakeWordListening()
-            }
+        statusText.text = "Listening..."
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "te-IN")
+            putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak now (Telugu or English)")
+            putExtra("android.speech.extra.SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS", 3000)
+            putExtra("android.speech.extra.SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS", 3000)
+            putExtra("android.speech.extra.SPEECH_INPUT_MINIMUM_LENGTH_MILLIS", 15000)
         }
-        watchdog = newWatchdog
-        mainHandler.postDelayed(newWatchdog, WATCHDOG_TIMEOUT_MS)
-    }
-
-    private val recognitionListener = object : RecognitionListener {
-        override fun onReadyForSpeech(params: Bundle?) {}
-        override fun onBeginningOfSpeech() {
-            cancelWatchdog()
-        }
-        override fun onRmsChanged(rmsdB: Float) {}
-        override fun onBufferReceived(buffer: ByteArray?) {}
-        override fun onEndOfSpeech() {}
-        override fun onEvent(eventType: Int, params: Bundle?) {}
-        override fun onPartialResults(partialResults: Bundle?) {}
-
-        override fun onError(error: Int) {
-            cancelWatchdog()
-            if (isListeningModeOn) {
-                mainHandler.postDelayed({ startWakeWordListening() }, 400)
-            }
-        }
-
-        override fun onResults(results: Bundle?) {
-            cancelWatchdog()
-            val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                ?.firstOrNull()
-                ?.trim()
-                ?: ""
-
-            if (!isListeningModeOn) return
-
-            if (!isAwaitingCommand) {
-                val lower = text.lowercase(Locale.getDefault())
-                if (lower.contains(WAKE_WORD) || lower.contains("lcd")) {
-                    val afterWake = stripWakeWord(text)
-                    if (afterWake.isNotBlank()) {
-                        heardText.text = "You said: $afterWake"
-                        sendToBackend(afterWake)
-                    } else {
-                        isAwaitingCommand = true
-                        startWakeWordListening()
-                    }
-                } else {
-                    startWakeWordListening()
-                }
-            } else {
-                isAwaitingCommand = false
-                if (text.isNotBlank()) {
-                    heardText.text = "You said: $text"
-                    sendToBackend(text)
-                } else {
-                    startWakeWordListening()
-                }
-            }
-        }
-    }
-
-    private fun stripWakeWord(text: String): String {
-        val lower = text.lowercase(Locale.getDefault())
-        val idx = lower.indexOf(WAKE_WORD)
-        return if (idx >= 0) {
-            text.substring(idx + WAKE_WORD.length).trim()
-        } else {
-            ""
+        try {
+            speechLauncher.launch(intent)
+        } catch (e: Exception) {
+            Toast.makeText(this, "Speech recognition not available on this device", Toast.LENGTH_LONG).show()
         }
     }
 
@@ -246,17 +117,13 @@ class MainActivity : AppCompatActivity() {
             override fun onFailure(call: Call, e: IOException) {
                 runOnUiThread {
                     statusText.text = "Couldn't reach LCD — check your internet"
-                    if (isListeningModeOn) startWakeWordListening()
                 }
             }
 
             override fun onResponse(call: Call, response: okhttp3.Response) {
                 val bodyStr = response.body?.string()
                 if (bodyStr == null) {
-                    runOnUiThread {
-                        statusText.text = "Empty response from server"
-                        if (isListeningModeOn) startWakeWordListening()
-                    }
+                    runOnUiThread { statusText.text = "Empty response from server" }
                     return
                 }
                 try {
@@ -266,18 +133,12 @@ class MainActivity : AppCompatActivity() {
 
                     runOnUiThread {
                         replyText.text = reply
+                        statusText.text = "Tap the button and speak"
+                        if (reply.isNotBlank()) speak(reply)
                         if (action != null) executeAction(action)
-                        if (reply.isNotBlank()) {
-                            speak(reply)
-                        } else if (isListeningModeOn) {
-                            startWakeWordListening()
-                        }
                     }
                 } catch (e: Exception) {
-                    runOnUiThread {
-                        statusText.text = "Couldn't understand server response"
-                        if (isListeningModeOn) startWakeWordListening()
-                    }
+                    runOnUiThread { statusText.text = "Couldn't understand server response" }
                 }
             }
         })
@@ -357,24 +218,9 @@ class MainActivity : AppCompatActivity() {
         return if (digitsOnly.length >= 7) digitsOnly else null
     }
 
-    override fun onPause() {
-        super.onPause()
-        cancelWatchdog()
-        destroyRecognizer()
-    }
-
-    override fun onResume() {
-        super.onResume()
-        if (isListeningModeOn) {
-            startWakeWordListening()
-        }
-    }
-
     override fun onDestroy() {
-        cancelWatchdog()
         tts.stop()
         tts.shutdown()
-        destroyRecognizer()
         super.onDestroy()
     }
 }
