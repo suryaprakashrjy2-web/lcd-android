@@ -5,9 +5,14 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.MediaStore
+import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
@@ -24,25 +29,11 @@ import org.json.JSONObject
 import java.io.IOException
 import java.util.Locale
 
-/**
- * LCD - tap-to-talk personal voice assistant.
- *
- * Flow:
- *   1. User taps the button -> Android's built-in speech recognizer listens (Telugu)
- *   2. Recognized text is sent to the LCD backend's /chat endpoint
- *   3. Backend replies with { reply, action }
- *   4. This activity speaks "reply" out loud (Telugu TTS) and executes "action"
- *      (open WhatsApp, call, send a WhatsApp message, open gallery)
- */
 class MainActivity : AppCompatActivity() {
 
-    // ---------------------------------------------------------------
-    // IMPORTANT: this is your live Render backend URL. If you ever
-    // redeploy under a different URL, update it here.
-    // ---------------------------------------------------------------
     private val BACKEND_URL = "https://lcd-backend.onrender.com/chat"
-
     private val TELUGU_LOCALE = Locale("te", "IN")
+    private val WAKE_WORD = "hey lcd"
 
     private lateinit var statusText: TextView
     private lateinit var heardText: TextView
@@ -50,26 +41,20 @@ class MainActivity : AppCompatActivity() {
     private lateinit var talkButton: Button
 
     private lateinit var tts: TextToSpeech
+    private lateinit var speechRecognizer: SpeechRecognizer
     private val httpClient = OkHttpClient()
+    private val mainHandler = Handler(Looper.getMainLooper())
 
-    private val speechLauncher =
-        registerForActivityResult(androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult()) { result ->
-            if (result.resultCode == RESULT_OK) {
-                val results = result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
-                val spokenText = results?.firstOrNull()
-                if (!spokenText.isNullOrBlank()) {
-                    heardText.text = "You said: $spokenText"
-                    sendToBackend(spokenText)
-                } else {
-                    statusText.text = "Didn't catch that — tap and try again"
-                }
-            } else {
-                statusText.text = "Tap the button and speak"
-            }
-        }
+    private var isListeningModeOn = false
+    private var isAwaitingCommand = false
 
     private val permissionLauncher =
-        registerForActivityResult(androidx.activity.result.contract.ActivityResultContracts.RequestMultiplePermissions()) { /* no-op, we check again on use */ }
+        registerForActivityResult(androidx.activity.result.contract.ActivityResultContracts.RequestMultiplePermissions()) { grants ->
+            val micGranted = grants[Manifest.permission.RECORD_AUDIO] == true
+            if (!micGranted) {
+                Toast.makeText(this, "Microphone permission is needed for 'Hey LCD'", Toast.LENGTH_LONG).show()
+            }
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -88,33 +73,134 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+        tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(utteranceId: String?) {}
+            override fun onDone(utteranceId: String?) {
+                if (isListeningModeOn) {
+                    mainHandler.post { startWakeWordListening() }
+                }
+            }
+            @Deprecated("Deprecated in Java")
+            override fun onError(utteranceId: String?) {
+                if (isListeningModeOn) {
+                    mainHandler.post { startWakeWordListening() }
+                }
+            }
+        })
 
-        // Ask for the permissions we need up front (mic + calling).
+        speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
+        speechRecognizer.setRecognitionListener(recognitionListener)
+
         permissionLauncher.launch(
             arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.CALL_PHONE)
         )
 
-        talkButton.setOnClickListener { startListening() }
+        talkButton.text = "▶ Start listening for \"Hey LCD\""
+        talkButton.setOnClickListener { toggleListeningMode() }
     }
 
-    private fun startListening() {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
-            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), 100)
-            return
+    private fun toggleListeningMode() {
+        if (isListeningModeOn) {
+            stopListeningMode()
+        } else {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+                != PackageManager.PERMISSION_GRANTED
+            ) {
+                ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), 100)
+                return
+            }
+            isListeningModeOn = true
+            talkButton.text = "⏹ Stop listening"
+            startWakeWordListening()
         }
+    }
 
-        statusText.text = "Listening..."
+    private fun stopListeningMode() {
+        isListeningModeOn = false
+        isAwaitingCommand = false
+        talkButton.text = "▶ Start listening for \"Hey LCD\""
+        statusText.text = "Stopped"
+        try {
+            speechRecognizer.stopListening()
+            speechRecognizer.cancel()
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun startWakeWordListening() {
+        if (!isListeningModeOn) return
+        statusText.text = if (isAwaitingCommand) "Yes? Listening for your command..." else "Listening for \"Hey LCD\"..."
+
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, "te-IN")
-            putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak now (Telugu or English)")
+            putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
+            putExtra("android.speech.extra.SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS", 2000)
+            putExtra("android.speech.extra.SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS", 2000)
         }
         try {
-            speechLauncher.launch(intent)
+            speechRecognizer.startListening(intent)
         } catch (e: Exception) {
-            Toast.makeText(this, "Speech recognition not available on this device", Toast.LENGTH_LONG).show()
+            mainHandler.postDelayed({ if (isListeningModeOn) startWakeWordListening() }, 500)
+        }
+    }
+
+    private val recognitionListener = object : RecognitionListener {
+        override fun onReadyForSpeech(params: Bundle?) {}
+        override fun onBeginningOfSpeech() {}
+        override fun onRmsChanged(rmsdB: Float) {}
+        override fun onBufferReceived(buffer: ByteArray?) {}
+        override fun onEndOfSpeech() {}
+        override fun onEvent(eventType: Int, params: Bundle?) {}
+        override fun onPartialResults(partialResults: Bundle?) {}
+
+        override fun onError(error: Int) {
+            if (isListeningModeOn) {
+                mainHandler.postDelayed({ startWakeWordListening() }, 400)
+            }
+        }
+
+        override fun onResults(results: Bundle?) {
+            val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                ?.firstOrNull()
+                ?.trim()
+                ?: ""
+
+            if (!isListeningModeOn) return
+
+            if (!isAwaitingCommand) {
+                val lower = text.lowercase(Locale.getDefault())
+                if (lower.contains(WAKE_WORD) || lower.contains("lcd")) {
+                    val afterWake = stripWakeWord(text)
+                    if (afterWake.isNotBlank()) {
+                        heardText.text = "You said: $afterWake"
+                        sendToBackend(afterWake)
+                    } else {
+                        isAwaitingCommand = true
+                        startWakeWordListening()
+                    }
+                } else {
+                    startWakeWordListening()
+                }
+            } else {
+                isAwaitingCommand = false
+                if (text.isNotBlank()) {
+                    heardText.text = "You said: $text"
+                    sendToBackend(text)
+                } else {
+                    startWakeWordListening()
+                }
+            }
+        }
+    }
+
+    private fun stripWakeWord(text: String): String {
+        val lower = text.lowercase(Locale.getDefault())
+        val idx = lower.indexOf(WAKE_WORD)
+        return if (idx >= 0) {
+            text.substring(idx + WAKE_WORD.length).trim()
+        } else {
+            ""
         }
     }
 
@@ -129,13 +215,17 @@ class MainActivity : AppCompatActivity() {
             override fun onFailure(call: Call, e: IOException) {
                 runOnUiThread {
                     statusText.text = "Couldn't reach LCD — check your internet"
+                    if (isListeningModeOn) startWakeWordListening()
                 }
             }
 
             override fun onResponse(call: Call, response: okhttp3.Response) {
                 val bodyStr = response.body?.string()
                 if (bodyStr == null) {
-                    runOnUiThread { statusText.text = "Empty response from server" }
+                    runOnUiThread {
+                        statusText.text = "Empty response from server"
+                        if (isListeningModeOn) startWakeWordListening()
+                    }
                     return
                 }
                 try {
@@ -145,12 +235,18 @@ class MainActivity : AppCompatActivity() {
 
                     runOnUiThread {
                         replyText.text = reply
-                        statusText.text = "Tap the button and speak"
-                        if (reply.isNotBlank()) speak(reply)
                         if (action != null) executeAction(action)
+                        if (reply.isNotBlank()) {
+                            speak(reply)
+                        } else if (isListeningModeOn) {
+                            startWakeWordListening()
+                        }
                     }
                 } catch (e: Exception) {
-                    runOnUiThread { statusText.text = "Couldn't understand server response" }
+                    runOnUiThread {
+                        statusText.text = "Couldn't understand server response"
+                        if (isListeningModeOn) startWakeWordListening()
+                    }
                 }
             }
         })
@@ -170,7 +266,7 @@ class MainActivity : AppCompatActivity() {
             "open_gallery" -> openGallery()
             "call" -> placeCall(target)
             "send_message" -> sendWhatsAppMessage(target, message)
-            else -> { /* nothing to do */ }
+            else -> { }
         }
     }
 
@@ -216,8 +312,6 @@ class MainActivity : AppCompatActivity() {
         ) {
             startActivity(Intent(Intent.ACTION_CALL, uri))
         } else {
-            // No call permission granted - fall back to opening the dialer
-            // pre-filled, so the user just taps the call button themselves.
             startActivity(Intent(Intent.ACTION_DIAL, uri))
         }
     }
@@ -227,15 +321,32 @@ class MainActivity : AppCompatActivity() {
         startActivity(intent)
     }
 
-    /** Very small helper: returns the string as-is if it looks like a phone number, else null. */
     private fun extractPhoneOrNull(text: String): String? {
         val digitsOnly = text.replace(Regex("[^0-9+]"), "")
         return if (digitsOnly.length >= 7) digitsOnly else null
     }
 
+    override fun onPause() {
+        super.onPause()
+        if (isListeningModeOn) {
+            try {
+                speechRecognizer.stopListening()
+                speechRecognizer.cancel()
+            } catch (e: Exception) { }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (isListeningModeOn) {
+            startWakeWordListening()
+        }
+    }
+
     override fun onDestroy() {
         tts.stop()
         tts.shutdown()
+        speechRecognizer.destroy()
         super.onDestroy()
     }
 }
